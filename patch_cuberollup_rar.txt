@@ -1,0 +1,545 @@
+diff -urN ./postgresql-9.3.5_orig/src/backend/parser/gram.y "./postgresql-9.3 (copy).5_orig/src/backend/parser/gram.y"
+--- ./postgresql-9.3.5_orig/src/backend/parser/gram.y	2014-07-22 00:40:42.000000000 +0530
++++ "./postgresql-9.3 (copy).5_orig/src/backend/parser/gram.y"	2014-11-26 01:30:17.536467768 +0530
+@@ -64,6 +64,7 @@
+ #include "utils/numeric.h"
+ #include "utils/xml.h"
+ 
++bool isGroupingSetOperation = false; /*added by ramesh */
+ 
+ /*
+  * Location tracking support --- simpler than bison's default, since we only
+@@ -333,7 +334,7 @@
+ 				target_list insert_column_list set_target_list
+ 				set_clause_list set_clause multiple_set_clause
+ 				ctext_expr_list ctext_row def_list indirection opt_indirection
+-				reloption_list group_clause TriggerFuncArgs select_limit
++				reloption_list group_clause grouping_sets rollup cube TriggerFuncArgs select_limit
+ 				opt_select_limit opclass_item_list opclass_drop_list
+ 				opclass_purpose opt_opfamily transaction_mode_list_or_empty
+ 				OptTableFuncElementList TableFuncElementList opt_type_modifiers
+@@ -523,7 +524,7 @@
+ 	COMMITTED CONCURRENTLY CONFIGURATION CONNECTION CONSTRAINT CONSTRAINTS
+ 	CONTENT_P CONTINUE_P CONVERSION_P COPY COST CREATE
+ 	CROSS CSV CURRENT_P
+-	CURRENT_CATALOG CURRENT_DATE CURRENT_ROLE CURRENT_SCHEMA
++	CURRENT_CATALOG CURRENT_DATE CUBE CURRENT_ROLE CURRENT_SCHEMA
+ 	CURRENT_TIME CURRENT_TIMESTAMP CURRENT_USER CURSOR CYCLE
+ 
+ 	DATA_P DATABASE DAY_P DEALLOCATE DEC DECIMAL_P DECLARE DEFAULT DEFAULTS
+@@ -537,7 +538,7 @@
+ 	FALSE_P FAMILY FETCH FIRST_P FLOAT_P FOLLOWING FOR FORCE FOREIGN FORWARD
+ 	FREEZE FROM FULL FUNCTION FUNCTIONS
+ 
+-	GLOBAL GRANT GRANTED GREATEST GROUP_P
++	GLOBAL GRANT GRANTED GREATEST GROUP_P GROUPING
+ 
+ 	HANDLER HAVING HEADER_P HOLD HOUR_P
+ 
+@@ -571,14 +572,14 @@
+ 
+ 	RANGE READ REAL REASSIGN RECHECK RECURSIVE REF REFERENCES REFRESH REINDEX
+ 	RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
+-	RESET RESTART RESTRICT RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK
++	RESET RESTART RESTRICT RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
+ 	ROW ROWS RULE
+ 
+ 	SAVEPOINT SCHEMA SCROLL SEARCH SECOND_P SECURITY SELECT SEQUENCE SEQUENCES
+ 	SERIALIZABLE SERVER SESSION SESSION_USER SET SETOF SHARE
+ 	SHOW SIMILAR SIMPLE SMALLINT SNAPSHOT SOME STABLE STANDALONE_P START
+ 	STATEMENT STATISTICS STDIN STDOUT STORAGE STRICT_P STRIP_P SUBSTRING
+-	SYMMETRIC SYSID SYSTEM_P
++	SYMMETRIC SYSID SYSTEM_P SETS
+ 
+ 	TABLE TABLES TABLESPACE TEMP TEMPLATE TEMPORARY TEXT_P THEN TIME TIMESTAMP
+ 	TO TRAILING TRANSACTION TREAT TRIGGER TRIM TRUE_P
+@@ -9195,21 +9196,187 @@
+  * NOTE: only the leftmost component SelectStmt should have INTO.
+  * However, this is not checked by the grammar; parse analysis must check it.
+  */
++ 
+ simple_select:
+ 			SELECT opt_distinct target_list
+-			into_clause from_clause where_clause
++			into_clause from_clause where_clause 
+ 			group_clause having_clause window_clause
+ 				{
+-					SelectStmt *n = makeNode(SelectStmt);
+-					n->distinctClause = $2;
+-					n->targetList = $3;
+-					n->intoClause = $4;
+-					n->fromClause = $5;
+-					n->whereClause = $6;
+-					n->groupClause = $7;
+-					n->havingClause = $8;
+-					n->windowClause = $9;
+-					$$ = (Node *)n;
++					SelectStmt *curr_parse_tree = makeNode(SelectStmt);
++					curr_parse_tree->distinctClause = $2;
++					curr_parse_tree->intoClause = $4;
++					curr_parse_tree->fromClause = $5;
++					curr_parse_tree->whereClause = $6;
++					curr_parse_tree->havingClause = $8;
++					curr_parse_tree->windowClause = $9;					
++					curr_parse_tree->targetList = $3;
++					curr_parse_tree->groupClause = $7;
++					$$ = (Node *)curr_parse_tree;					
++					
++					if(curr_parse_tree->groupClause != NIL && isGroupingSetOperation )
++					{
++						isGroupingSetOperation = false;
++						ListCell   *group_by_column;	
++						int num_rows = 0;
++						SelectStmt *acc_parse_tree = makeNode(SelectStmt);
++						List * group_by_list = $7;
++
++						foreach(group_by_column, group_by_list)
++						{
++							curr_parse_tree = makeNode(SelectStmt);
++							ColumnRef * col_obj = lfirst(group_by_column);
++							
++							if(IsA(lfirst(group_by_column), NullTest))
++							{
++								ListCell * cell;
++								List * target_col_list = (List *) copyObject($3);
++								
++								foreach(cell, target_col_list)
++								{
++									ResTarget * res_target = (ResTarget *)lfirst(cell);
++									
++									if(nodeTag(res_target->val) == T_FuncCall)
++									{
++										continue;
++									}
++									
++									ColumnRef * target_col_obj = res_target->val;
++									Value * value_node = ((Value *) lfirst((target_col_obj->fields)->head));								
++
++									A_Const *null_node = makeNode(A_Const);
++									null_node->val.type = T_Null;
++									null_node->val.val.str = "NULL";
++									null_node->location = 7;
++									
++									
++									res_target->name = value_node->val.str;
++									res_target->val = null_node;
++								}
++	
++								curr_parse_tree->targetList = target_col_list;
++								curr_parse_tree->groupClause = NIL;
++							}
++							else if(col_obj->type == T_RowExpr)
++							{
++								List * grouping_set_list = NULL;
++								ListCell *cell = NULL;
++								foreach(cell, ((RowExpr *)col_obj)->args)
++								{
++									if(grouping_set_list == NULL)
++										grouping_set_list = list_make1((ColumnRef *)lfirst(cell));
++									else
++										grouping_set_list = lappend(grouping_set_list, (ColumnRef *)lfirst(cell));
++								}
++							
++								List * target_col_list = (List *) copyObject($3);
++								ListCell *cell2 = NULL;
++								
++								foreach(cell2, target_col_list)
++								{
++									ResTarget * res_target = (ResTarget *)lfirst(cell2);
++									if(nodeTag(res_target->val) == T_FuncCall)
++									{
++										continue;
++									}
++							
++									ColumnRef * target_col_obj = res_target->val;
++									Value * value_node = ((Value *) lfirst((target_col_obj->fields)->head));
++
++									int isNodeInList = 0;
++									ListCell * cell3;								
++									foreach(cell3, grouping_set_list)
++									{
++										ColumnRef * group_by_col_object = (ColumnRef *)lfirst(cell3);
++									
++										Value * group_by_value_node = ((Value *) lfirst((group_by_col_object->fields)->head));
++										if(!strcmp(group_by_value_node->val.str,value_node->val.str))
++										{
++											isNodeInList = 1;
++											break;
++										}
++									}									
++
++									if(isNodeInList == 0)
++									{
++										A_Const *null_node = makeNode(A_Const);
++										null_node->val.type = T_Null;
++										null_node->val.val.str = "NULL";
++										null_node->location = 7;
++										
++										res_target->name = value_node->val.str;
++										res_target->val = null_node;
++									}
++									else  /*Casting to text*/
++									{
++										TypeCast * type_casted_target_col = (TypeCast *) makeTypeCast(target_col_obj, SystemTypeName("text"), @1);				res_target->val = type_casted_target_col;									
++									}									
++								}
++								
++								curr_parse_tree->targetList = target_col_list;
++								curr_parse_tree->groupClause = grouping_set_list;								
++							}
++							else
++							{
++								char * column = ((const Value *) lfirst((col_obj->fields)->head))->val.str;
++	
++								ListCell * cell;
++								List * target_col_list = (List *) copyObject($3);
++																
++								foreach(cell, target_col_list)
++								{									
++									ResTarget * res_target = (ResTarget *)lfirst(cell);
++
++									if(nodeTag(res_target->val) == T_FuncCall)
++									{
++										continue;
++									}
++									
++									ColumnRef * target_col_obj = res_target->val;
++	
++									Value * value_node = ((Value *) lfirst((target_col_obj->fields)->head));
++
++									if(strcmp(value_node->val.str, column))
++									{
++										A_Const *null_node = makeNode(A_Const);
++										null_node->val.type = T_Null;
++										null_node->val.val.str = "NULL";
++										null_node->location = 7;
++										
++										res_target->name = value_node->val.str;
++										res_target->val = null_node;									
++									}
++									else  	/*Casting to text*/
++									{
++										
++										TypeCast * type_casted_target_col = (TypeCast *) makeTypeCast(target_col_obj, SystemTypeName("text"), @1);									
++										res_target->val = type_casted_target_col;									
++									}
++								}
++	
++								curr_parse_tree->targetList = target_col_list;
++								curr_parse_tree->groupClause = list_make1(lfirst(group_by_column));
++							}
++
++							curr_parse_tree->distinctClause = $2;
++							curr_parse_tree->intoClause = $4;
++							curr_parse_tree->fromClause = $5;
++							curr_parse_tree->whereClause = $6;
++							curr_parse_tree->havingClause = $8;
++							curr_parse_tree->windowClause = $9;
++
++							if(num_rows != 0)
++							{
++								acc_parse_tree = makeSetOp(SETOP_UNION, TRUE, acc_parse_tree, curr_parse_tree);
++							}
++							else
++							{
++								acc_parse_tree = curr_parse_tree;
++							}
++							num_rows++;							
++						}
++
++						$$ = acc_parse_tree;
++					}
+ 				}
+ 			| values_clause							{ $$ = $1; }
+ 			| TABLE relation_expr
+@@ -9498,12 +9665,192 @@
+ 			| NEXT									{ $$ = 0; }
+ 		;
+ 
+-
+ group_clause:
+-			GROUP_P BY expr_list					{ $$ = $3; }
+-			| /*EMPTY*/								{ $$ = NIL; }
++			GROUP_P BY grouping_sets			{ $$ = $3;}
++			| GROUP_P BY rollup					{ $$ = $3;}
++			| GROUP_P BY cube					{ $$ = $3;}
++			| /*EMPTY*/							{ $$ = NIL; }
+ 		;
++/**************** ADDITION STARTS ***********************/
++		
++grouping_sets:
++			GROUPING SETS '(' expr_list ')'		{ $$ = $4; isGroupingSetOperation = true;  }
++			| expr_list							{ $$ = $1; }
++		;
++
++/**** RGWORK ****/
++	
++cube:
++	CUBE '(' expr_list ')'	{ 				isGroupingSetOperation = true;
++											ListCell   *group_by_column;	
++											int num_rows = 0;
++											SelectStmt *acc_parse_tree = makeNode(SelectStmt);
++											List * group_by_list = $3;
++
++											int totalColumns= list_length(group_by_list);
++											int setSize = pow(2,totalColumns);
++											List * cube_list = NULL;
++
++											char *columnVals[totalColumns];
++											
++											int k=0;
++											ColumnRef * colarray[totalColumns];
++											foreach(group_by_column, group_by_list)
++											{
++												
++												ColumnRef * col_obj = lfirst(group_by_column);
++												
++												char * column = ((const Value *) lfirst((col_obj->fields)->head))->val.str;
++												
++												columnVals[k] = (char *)malloc(sizeof(column));
++												columnVals[k] = column;
++
++												colarray[k] = col_obj;
++
++												k++;
++																							
++												if(cube_list == NULL)
++													cube_list = list_make1(col_obj);
++												else
++													cube_list = lappend(cube_list, col_obj);
++											}
++
++											
++											
++											/*** Create power Set ***/
++																		
++									        int j,loop_var;
++
++									        for(k=0;k<setSize;k++)
++									        {
++									        	List * row_list = NULL;
++
++									        	loop_var = 0;
++									                for(j = 0; j < setSize; j++)
++									                {
++									                  if(k & (1<<j))
++									                   {
++									                    loop_var ++;
++									                   	if(row_list == NULL)
++															row_list = list_make1(colarray[j]);
++														else
++															row_list = lappend(row_list, colarray[j]);
++									                   }
++									                 
++									                }
++									            
++									            if(row_list != NULL)
++										        {
++										        	
++										        	if(loop_var > 1)
++										        	{
++										        		
++										        		RowExpr *cube_row_in = makeNode(RowExpr);
++														cube_row_in ->args = row_list;
++														cube_row_in ->row_typeid = InvalidOid;	/* not analyzed yet */
++														cube_row_in ->colnames = NIL;	/* to be filled in during analysis */
++														cube_row_in ->location = @1;
++														
++														cube_list = lappend(cube_list, (ColumnRef *)cube_row_in);
++
++										        	}
++										        	
++
++										        }
++		
++									        }
++
++
++									        
++											NullTest *null_node_cube = makeNode(NullTest);
++									        
++											cube_list = lappend(cube_list, null_node_cube);
++
++									        $$=cube_list;
++											
+ 
++										}
++	;
++
++rollup:
++		ROLLUP '(' expr_list ')'		{ 	isGroupingSetOperation = true;
++											ListCell   *group_by_column;	
++											int num_rows = 0;
++											SelectStmt *acc_parse_tree = makeNode(SelectStmt);
++											List * group_by_list = $3;
++
++											int totalColumns= list_length(group_by_list);
++											int setSize = pow(2,totalColumns);
++											List * rollup_list = NULL;
++
++											char *columnVals[totalColumns];
++											
++											int k=0;
++											ColumnRef * colarray[totalColumns];
++											foreach(group_by_column, group_by_list)
++											{
++												
++												ColumnRef * col_obj = lfirst(group_by_column);
++												
++												char * column = ((const Value *) lfirst((col_obj->fields)->head))->val.str;
++												
++												columnVals[k] = (char *)malloc(sizeof(column));
++												columnVals[k] = column;
++
++												colarray[k] = col_obj;
++
++												k++;
++																							
++												if(rollup_list == NULL)
++													rollup_list = list_make1(col_obj);
++												
++											}
++
++											
++											
++											/*** Create power Set ***/
++											int j;
++
++									        for(k=2;k<=totalColumns;k++)
++									        {
++									        	List * row_list = NULL;
++
++									        	for(j = 0; j < k; j++)
++									                {
++									                    
++									                   	if(row_list == NULL)
++															row_list = list_make1(colarray[j]);
++														else
++															row_list = lappend(row_list, colarray[j]);
++									                						                 
++									                }
++									            
++									            if(row_list != NULL)
++										        {
++										        	RowExpr *rollup_row_in = makeNode(RowExpr);
++													rollup_row_in ->args = row_list;
++													rollup_row_in ->row_typeid = InvalidOid;	/* not analyzed yet */
++													rollup_row_in ->colnames = NIL;	/* to be filled in during analysis */
++													rollup_row_in ->location = @1;
++													
++													rollup_list = lappend(rollup_list, (ColumnRef *)rollup_row_in);
++												}
++		
++									        }
++
++
++									        
++											NullTest *null_node_rollup = makeNode(NullTest);
++									        
++											rollup_list = lappend(rollup_list, null_node_rollup);
++
++									        
++											$$=rollup_list;
++											
++										}
++	;
++
++/************ ADDITION ENDS ***************************/
+ having_clause:
+ 			HAVING a_expr							{ $$ = $2; }
+ 			| /*EMPTY*/								{ $$ = NULL; }
+@@ -10935,6 +11282,11 @@
+ 														 list_make1($1), @2),
+ 											 @2);
+ 				}
++			| '(' ')' 
++			{
++					NullTest *n = makeNode(NullTest);
++					$$ = (Node *)n;			
++			}
+ 		;
+ 
+ /*
+@@ -12082,6 +12434,7 @@
+ 				}
+ 		;
+ 
++
+ /* function arguments can have names */
+ func_arg_list:  func_arg_expr
+ 				{
+@@ -12901,6 +13254,7 @@
+ 			| SERVER
+ 			| SESSION
+ 			| SET
++			| SETS
+ 			| SHARE
+ 			| SHOW
+ 			| SIMPLE
+@@ -13077,6 +13431,7 @@
+ 			| COLUMN
+ 			| CONSTRAINT
+ 			| CREATE
++			| CUBE
+ 			| CURRENT_CATALOG
+ 			| CURRENT_DATE
+ 			| CURRENT_ROLE
+@@ -13098,6 +13453,7 @@
+ 			| FROM
+ 			| GRANT
+ 			| GROUP_P
++			| GROUPING
+ 			| HAVING
+ 			| IN_P
+ 			| INITIALLY
+@@ -13119,6 +13475,7 @@
+ 			| PRIMARY
+ 			| REFERENCES
+ 			| RETURNING
++			| ROLLUP
+ 			| SELECT
+ 			| SESSION_USER
+ 			| SOME
+@@ -13152,6 +13509,7 @@
+ 	parser_yyerror(msg);
+ }
+ 
++
+ static Node *
+ makeColumnRef(char *colname, List *indirection,
+ 			  int location, core_yyscan_t yyscanner)
+diff -urN ./postgresql-9.3.5_orig/src/include/parser/kwlist.h "./postgresql-9.3 (copy).5_orig/src/include/parser/kwlist.h"
+--- ./postgresql-9.3.5_orig/src/include/parser/kwlist.h	2014-07-22 00:40:42.000000000 +0530
++++ "./postgresql-9.3 (copy).5_orig/src/include/parser/kwlist.h"	2014-11-26 01:29:47.676468650 +0530
+@@ -98,6 +98,7 @@
+ PG_KEYWORD("create", CREATE, RESERVED_KEYWORD)
+ PG_KEYWORD("cross", CROSS, TYPE_FUNC_NAME_KEYWORD)
+ PG_KEYWORD("csv", CSV, UNRESERVED_KEYWORD)
++PG_KEYWORD("cube", CUBE, RESERVED_KEYWORD)
+ PG_KEYWORD("current", CURRENT_P, UNRESERVED_KEYWORD)
+ PG_KEYWORD("current_catalog", CURRENT_CATALOG, RESERVED_KEYWORD)
+ PG_KEYWORD("current_date", CURRENT_DATE, RESERVED_KEYWORD)
+@@ -172,6 +173,7 @@
+ PG_KEYWORD("granted", GRANTED, UNRESERVED_KEYWORD)
+ PG_KEYWORD("greatest", GREATEST, COL_NAME_KEYWORD)
+ PG_KEYWORD("group", GROUP_P, RESERVED_KEYWORD)
++PG_KEYWORD("grouping", GROUPING, RESERVED_KEYWORD)
+ PG_KEYWORD("handler", HANDLER, UNRESERVED_KEYWORD)
+ PG_KEYWORD("having", HAVING, RESERVED_KEYWORD)
+ PG_KEYWORD("header", HEADER_P, UNRESERVED_KEYWORD)
+@@ -320,6 +322,7 @@
+ PG_KEYWORD("right", RIGHT, TYPE_FUNC_NAME_KEYWORD)
+ PG_KEYWORD("role", ROLE, UNRESERVED_KEYWORD)
+ PG_KEYWORD("rollback", ROLLBACK, UNRESERVED_KEYWORD)
++PG_KEYWORD("rollup", ROLLUP, RESERVED_KEYWORD)
+ PG_KEYWORD("row", ROW, COL_NAME_KEYWORD)
+ PG_KEYWORD("rows", ROWS, UNRESERVED_KEYWORD)
+ PG_KEYWORD("rule", RULE, UNRESERVED_KEYWORD)
+@@ -338,6 +341,7 @@
+ PG_KEYWORD("session_user", SESSION_USER, RESERVED_KEYWORD)
+ PG_KEYWORD("set", SET, UNRESERVED_KEYWORD)
+ PG_KEYWORD("setof", SETOF, COL_NAME_KEYWORD)
++PG_KEYWORD("sets", SETS, UNRESERVED_KEYWORD)
+ PG_KEYWORD("share", SHARE, UNRESERVED_KEYWORD)
+ PG_KEYWORD("show", SHOW, UNRESERVED_KEYWORD)
+ PG_KEYWORD("similar", SIMILAR, TYPE_FUNC_NAME_KEYWORD)
