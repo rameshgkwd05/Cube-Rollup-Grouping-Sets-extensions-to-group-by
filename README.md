@@ -27,11 +27,11 @@ For roll up we take the prefixes of the grouping set list.
 The following figure outlines the flow of the program. Query is tokenized and given to
 parser (gram.y). The query is then parsed to generate a parse tree. We intercept this
 parse tree and modify the tree to match the parse tree of grouping set.
-![overview]
+![overview](https://github.com/rameshgkwd05/Cube-Rollup-Grouping-Sets-extensions-to-group-by/blob/master/overview.jpg)
 
 #Grouping set implementation
 For grouping sets, we iterate over the list of group by columns present in the group by list. For each entry in list we create a select query parse tree with group by that column.All the columns which are not present in group by list and are not aggregate functions are converted to null. We also cast the target columns to string while displaying the output.
-![GroupingSetImpl]
+![GroupingSet](https://github.com/rameshgkwd05/Cube-Rollup-Grouping-Sets-extensions-to-group-by/blob/master/groupingSet.jpg)
 
 #Instructions for installing  patch:
 
